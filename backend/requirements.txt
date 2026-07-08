@@ -1,0 +1,47 @@
+# backend/requirements.txt
+# Install with: pip install -r requirements.txt
+
+# ── Pinned first ──────────────────────────────────────────
+numpy==2.1.0
+
+# ── Web framework ─────────────────────────────────────────
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# ── Authentication ────────────────────────────────────────
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+python-multipart==0.0.9
+
+# ── Database ──────────────────────────────────────────────
+motor==3.7.1
+pymongo==4.17.0
+
+# ── Settings ──────────────────────────────────────────────
+pydantic-settings==2.14.2
+
+# ── AI / RAG pipeline ─────────────────────────────────────
+langchain==0.3.25
+langchain-community==0.3.25
+langchain-ollama==0.3.3
+langchain-core==0.3.65
+langchain-text-splitters==0.3.8
+
+# ── Vector store ──────────────────────────────────────────
+faiss-cpu==1.9.0.post1
+
+# ── PDF processing ────────────────────────────────────────
+pypdf==4.3.0
+pdfplumber==0.11.0
+
+# ── OCR ───────────────────────────────────────────────────
+pytesseract==0.3.10
+pdf2image==1.17.0
+
+# ── HTTP client ───────────────────────────────────────────
+httpx==0.27.0
+
+# ── Utilities ─────────────────────────────────────────────
+python-dotenv==1.2.2
+aiofiles==24.1.0
