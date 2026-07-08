@@ -1,0 +1,1 @@
+export default function Chat() { return <div style={{background:'#0F1117',minHeight:'100vh',color:'white',display:'flex',alignItems:'center',justifyContent:'center'}}><h1 style={{color:'#FF6B00'}}>Chat Page</h1></div> }
