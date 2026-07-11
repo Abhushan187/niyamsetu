@@ -33,7 +33,8 @@ from api.embed   import router as embed_router
 from api.query   import router as query_router
 from api.graph   import router as graph_router
 from api.summary import router as summary_router
-from api.logs    import router as logs_router
+from api.logs     import router as logs_router
+from api.sessions import router as sessions_router
 
 # ── Create FastAPI app ────────────────────────────────────
 app = FastAPI(
@@ -71,6 +72,7 @@ app.include_router(query_router)
 app.include_router(graph_router)
 app.include_router(summary_router)
 app.include_router(logs_router)
+app.include_router(sessions_router)
 
 
 # ── Startup and shutdown events ───────────────────────────

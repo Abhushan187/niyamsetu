@@ -23,6 +23,7 @@ from pydantic import BaseModel
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from auth.router import get_admin_user, get_current_user
 from core.summarizer import process_gr, list_summaries
+from db.gr_meta import get_all_gr_metadata
 from config import settings
 
 router = APIRouter(prefix="/api/summary", tags=["Summary"])
@@ -43,6 +44,37 @@ _summary_state = {
 class GenerateRequest(BaseModel):
     """What the frontend sends to trigger summary generation."""
     filename: str   # e.g. "GR_2024_transfer.pdf"
+
+
+# ── Batch summary job state tracker ───────────────────────
+# Same in-memory pattern as _summary_state and embed.py's _embed_state.
+_batch_state = {
+    "running":       False,
+    "last_status":   "idle",      # idle | running | done | failed
+    "last_message":  "Not started",
+    "progress":      0,           # 0-100
+    "total_files":   0,
+    "completed":     0,           # exact count done so far — used for "X/Y" UI
+    "current_file":  "",
+    "failed_files":  [],
+}
+
+
+async def get_pending_summary_files() -> list:
+    """
+    Returns filenames of GRs that are embedded but have no summary yet.
+    Compares gr_metadata (embedded=True) against existing summary JSON files.
+    This is what powers the "X documents need summarizing" banner.
+    """
+    all_metadata = await get_all_gr_metadata()
+    existing_summaries = list_summaries()
+    summarized_filenames = {s["filename"] for s in existing_summaries}
+
+    pending = [
+        m["filename"] for m in all_metadata
+        if m.get("embedded") and m["filename"] not in summarized_filenames
+    ]
+    return pending
 
 
 async def _run_summary_job(pdf_path: str, filename: str):
@@ -144,9 +176,123 @@ async def get_summary_status(
     }
 
 
+@router.get("/pending")
+async def get_pending_summaries(
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Returns list of embedded GRs that don't have a summary yet.
+    Used by KnowledgeBase.jsx to show the persistent
+    "N documents need summarizing" banner.
+    """
+    pending = await get_pending_summary_files()
+    return {
+        "success": True,
+        "pending": pending,
+        "total":   len(pending),
+    }
+
+
+async def _run_batch_summary_job(filenames: list):
+    """
+    Background job — runs process_gr() for each pending file in sequence.
+    Sequential (not parallel) because each summary is a heavy LLM call —
+    running them in parallel would overload Ollama on modest hardware.
+    """
+    global _batch_state
+
+    _batch_state["running"]      = True
+    _batch_state["last_status"]  = "running"
+    _batch_state["total_files"]  = len(filenames)
+    _batch_state["completed"]    = 0
+    _batch_state["failed_files"] = []
+    _batch_state["progress"]     = 0
+
+    for i, filename in enumerate(filenames, 1):
+        _batch_state["current_file"] = filename
+        _batch_state["last_message"] = f"Summarizing {filename} ({i}/{len(filenames)})"
+
+        pdf_path = settings.GRDOCS_PATH / filename
+        try:
+            result = await process_gr(str(pdf_path))
+            if not result["success"]:
+                _batch_state["failed_files"].append(filename)
+        except Exception:
+            _batch_state["failed_files"].append(filename)
+
+        _batch_state["completed"] = i
+        _batch_state["progress"]  = round((i / len(filenames)) * 100)
+
+    _batch_state["running"]     = False
+    _batch_state["last_status"] = "failed" if _batch_state["failed_files"] else "done"
+    fail_note = (
+        f" {len(_batch_state['failed_files'])} failed."
+        if _batch_state["failed_files"] else ""
+    )
+    _batch_state["last_message"] = f"Done. {len(filenames)} document(s) processed.{fail_note}"
+
+
+@router.post("/generate-batch")
+async def generate_batch_summaries(
+    background_tasks: BackgroundTasks,
+    admin: dict = Depends(get_admin_user),
+):
+    """
+    Starts summary generation for ALL embedded-but-unsummarized GRs.
+    Admin only. Triggered by the "Summarize Pending" button.
+
+    Returns immediately — frontend polls /batch-status for progress.
+    """
+    global _batch_state
+
+    if _batch_state["running"]:
+        return {
+            "success": False,
+            "message": "Batch summarization already running.",
+            "state":   _batch_state,
+        }
+
+    pending = await get_pending_summary_files()
+    if not pending:
+        return {
+            "success": False,
+            "message": "No documents need summarizing.",
+            "state":   _batch_state,
+        }
+
+    _batch_state.update({
+        "running":      True,
+        "last_status":  "running",
+        "last_message": f"Starting batch summary for {len(pending)} document(s)...",
+        "progress":     0,
+        "total_files":  len(pending),
+        "current_file": "",
+        "failed_files": [],
+    })
+
+    background_tasks.add_task(_run_batch_summary_job, pending)
+
+    return {
+        "success": True,
+        "message": f"Batch summarization started for {len(pending)} document(s).",
+        "state":   _batch_state,
+    }
+
+
+@router.get("/batch-status")
+async def get_batch_status(
+    admin: dict = Depends(get_admin_user),
+):
+    """Returns current batch summarization progress. Polled every 3s."""
+    return {
+        "success": True,
+        "state":   _batch_state,
+    }
+
+
 @router.get("/list")
 async def get_summaries_list(
-    admin: dict = Depends(get_admin_user),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Returns list of all previously generated summaries.
@@ -163,7 +309,7 @@ async def get_summaries_list(
 @router.get("/download/{filename}")
 async def download_summary(
     filename: str,
-    admin: dict = Depends(get_admin_user),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Downloads a summary TXT file.

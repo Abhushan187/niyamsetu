@@ -1,1 +1,0 @@
-export default function History() { return <div style={{background:'#0F1117',minHeight:'100vh',color:'white',display:'flex',alignItems:'center',justifyContent:'center'}}><h1 style={{color:'#FF6B00'}}>History Page</h1></div> }

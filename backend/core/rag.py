@@ -191,9 +191,14 @@ async def query(
     # If no docs returned, vector store is not ready
     if not docs:
         elapsed = round(time.time() - start_time, 2)
+        no_docs_message = (
+            "⚠️ माहिती संच अद्याप तयार नाही. कृपया प्रशासकाला शासन निर्णय दस्तऐवज अपलोड करण्यास सांगा."
+            if language == "marathi"
+            else "⚠️ Vector store is not ready. Please ask admin to embed the GR documents first."
+        )
         return {
             "success":     False,
-            "answer":      "⚠️ Vector store is not ready. Please ask admin to embed the GR documents first.",
+            "answer":      no_docs_message,
             "citations":   [],
             "language":    language,
             "elapsed_sec": elapsed,

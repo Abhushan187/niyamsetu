@@ -20,18 +20,16 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { AuthProvider } from './context/AuthContext'
 import ProtectedRoute from './components/ProtectedRoute'
 import AdminRoute from './components/AdminRoute'
+import Layout from './components/Layout'
 
 // Pages
 import Login   from './pages/Login'
 import Chat    from './pages/Chat'
-import Search  from './pages/Search'
-import Graph   from './pages/Graph'
-import History from './pages/History'
-import Upload  from './pages/Upload'
-import Embed   from './pages/Embed'
-import Summary from './pages/Summary'
-import Logs    from './pages/Logs'
-import Users   from './pages/Users'
+import Upload   from './pages/Upload'
+import Users    from './pages/Users'
+import Summaries from './pages/Summaries'
+import Analytics from './pages/Analytics'
+import KnowledgeBase from './pages/KnowledgeBase'
 
 export default function App() {
   return (
@@ -50,40 +48,28 @@ export default function App() {
 
           {/* ── User routes (login required) ──────────── */}
           <Route path="/chat" element={
-            <ProtectedRoute><Chat /></ProtectedRoute>
+            <ProtectedRoute><Layout><Chat /></Layout></ProtectedRoute>
           } />
 
-          <Route path="/search" element={
-            <ProtectedRoute><Search /></ProtectedRoute>
+          <Route path="/summaries" element={
+            <ProtectedRoute><Layout><Summaries /></Layout></ProtectedRoute>
           } />
 
-          <Route path="/graph" element={
-            <ProtectedRoute><Graph /></ProtectedRoute>
-          } />
-
-          <Route path="/history" element={
-            <ProtectedRoute><History /></ProtectedRoute>
-          } />
-
-          {/* ── Admin routes (admin role required) ────── */}
+          {/* ── Admin routes ───────────────────────────── */}
           <Route path="/admin/upload" element={
-            <AdminRoute><Upload /></AdminRoute>
+            <AdminRoute><Layout><Upload /></Layout></AdminRoute>
           } />
 
-          <Route path="/admin/embed" element={
-            <AdminRoute><Embed /></AdminRoute>
+          <Route path="/admin/knowledge" element={
+            <AdminRoute><Layout><KnowledgeBase /></Layout></AdminRoute>
           } />
 
-          <Route path="/admin/summary" element={
-            <AdminRoute><Summary /></AdminRoute>
-          } />
-
-          <Route path="/admin/logs" element={
-            <AdminRoute><Logs /></AdminRoute>
+          <Route path="/admin/analytics" element={
+            <AdminRoute><Layout><Analytics /></Layout></AdminRoute>
           } />
 
           <Route path="/admin/users" element={
-            <AdminRoute><Users /></AdminRoute>
+            <AdminRoute><Layout><Users /></Layout></AdminRoute>
           } />
 
           {/* Catch-all — unknown URLs redirect to login */}
