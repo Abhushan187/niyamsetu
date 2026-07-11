@@ -76,6 +76,7 @@ Seeded automatically on first backend startup if the `users` collection is empty
 
 ## Project Structure
 
+```
 niyamsetu/
 ├── backend/
 │   ├── auth/       — JWT auth, login, user management
@@ -89,14 +90,16 @@ niyamsetu/
         ├── components/  — shared UI (Navbar, Sidebar, Layout)
         ├── context/      — AuthContext, ChatContext
         └── api/          — Axios client
+```
 
 ## Workflow for Contributors
 
 1. Create a feature branch off `main`.
 2. Backend: business logic goes in `core/`, HTTP handling in `api/`, DB ops in `db/` — never mix these.
 3. Frontend: inline styles only (no Tailwind classes), state via Context, all API calls through `src/api/client.js`.
-4. Open a PR — CI runs the offline test suite automatically.
-5. PRs are reviewed before merging to `main`.
+4. Open a PR — CI runs the offline test suite automatically (`test_units.py` + `test_config.py`, no external services required).
+5. Before approving any PR, run the full test suite locally: `python tests/run_all_tests.py` (no `--offline` flag). This includes `test_integration.py`, which requires MongoDB and Ollama running — currently only Harsh's machine has both. Harsh should run this before approving merges to `main`.
+6. PRs are reviewed before merging to `main`.
 
 ## Known Constraints
 
