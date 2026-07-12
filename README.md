@@ -29,7 +29,7 @@ git clone https://github.com/Abhushan187/niyamsetu.git
 cd niyamsetu
 
 Create `backend/.env`:
-
+````
 MONGODB_URL=mongodb://localhost:27017
 DATABASE_NAME=niyamsetu
 JWT_SECRET=change-this-to-something-random
@@ -38,7 +38,7 @@ OLLAMA_BASE_URL=http://localhost:11434
 EMBEDDING_MODEL=nomic-embed-text
 LLM_MODEL=phi4-mini
 DATA_DIR=./data
-
+````
 ### 2. Backend
 
 cd backend
