@@ -54,8 +54,8 @@ def _load_pdf_text(pdf_path: str) -> str:
     Returns:
         Cleaned text string, max 12000 characters
     """
-    loader    = PyPDFLoader(pdf_path)
-    documents = loader.load()
+    from core.ocr import load_pdf_with_ocr_fallback
+    documents = load_pdf_with_ocr_fallback(pdf_path)
 
     # Join all pages into one text block
     full_text = "\n".join(doc.page_content for doc in documents)

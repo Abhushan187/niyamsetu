@@ -148,8 +148,8 @@ async def embed_all_pdfs(progress_callback=None) -> dict:
             progress_callback(pdf_path.name, i + 1, len(pdf_files))
 
         try:
-            loader = PyPDFLoader(str(pdf_path))
-            pages  = loader.load()
+            from core.ocr import load_pdf_with_ocr_fallback
+            pages = load_pdf_with_ocr_fallback(str(pdf_path))
 
             # Add filename to each page's metadata
             # This is what powers citations later —
