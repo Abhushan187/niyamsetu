@@ -158,21 +158,20 @@ async def delete_uploaded_file(
     filename: str,
     admin: dict = Depends(get_admin_user),
 ):
-    """
-    Deletes a GR file from disk and removes its MongoDB record.
-    Admin only.
-
-    Note: does NOT automatically rebuild the vector store.
-    Admin must re-embed after deleting files.
-    """
     file_path = settings.GRDOCS_PATH / filename
 
-    # Delete from disk if it exists
     if file_path.exists():
         file_path.unlink()
 
-    # Delete metadata from MongoDB
     result = await delete_gr_metadata(filename)
+
+    # Also remove any generated summary files for this GR —
+    # otherwise Summaries page keeps showing a summary for a GR that no longer exists
+    base_name = Path(filename).stem
+    for ext in ("_summary.json", "_summary.txt"):
+        summary_file = settings.SUMMARIES_PATH / f"{base_name}{ext}"
+        if summary_file.exists():
+            summary_file.unlink()
 
     return {
         "success": True,
