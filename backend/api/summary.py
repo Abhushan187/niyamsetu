@@ -333,3 +333,52 @@ async def download_summary(
         filename=filename,
         media_type="text/plain",
     )
+
+
+class GenerateSelectedRequest(BaseModel):
+    filenames: list[str]
+
+
+@router.post("/generate-selected")
+async def generate_selected_summaries(
+    request: GenerateSelectedRequest,
+    background_tasks: BackgroundTasks,
+    admin: dict = Depends(get_admin_user),
+):
+    """
+    Starts summary generation for only the specified GR files —
+    not all pending files like /generate-batch. Lets admin
+    prioritize summarizing specific urgent GRs via checkboxes.
+    Reuses the same _batch_state tracker and /batch-status endpoint
+    as /generate-batch, since only one batch-style job should run
+    at a time regardless of which button triggered it.
+    """
+    global _batch_state
+
+    if _batch_state["running"]:
+        return {
+            "success": False,
+            "message": "A summarization job is already running.",
+            "state":   _batch_state,
+        }
+
+    if not request.filenames:
+        return {"success": False, "message": "No files selected.", "state": _batch_state}
+
+    _batch_state.update({
+        "running":      True,
+        "last_status":  "running",
+        "last_message": f"Starting summary for {len(request.filenames)} selected document(s)...",
+        "progress":     0,
+        "total_files":  len(request.filenames),
+        "current_file": "",
+        "failed_files": [],
+    })
+
+    background_tasks.add_task(_run_batch_summary_job, request.filenames)
+
+    return {
+        "success": True,
+        "message": f"Summarization started for {len(request.filenames)} selected document(s).",
+        "state":   _batch_state,
+    }

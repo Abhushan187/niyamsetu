@@ -225,6 +225,100 @@ async def embed_all_pdfs(progress_callback=None) -> dict:
         }
 
 
+async def add_pdfs_to_store(filenames: list, progress_callback=None) -> dict:
+    """
+    Incrementally adds specific PDFs to the existing FAISS index,
+    without rebuilding the whole vector store from scratch.
+    Used by the "Add Selected" button in KnowledgeBase — lets admin
+    embed newly uploaded GRs without waiting through a full rebuild
+    of everything already embedded.
+
+    Args:
+        filenames         : list of PDF filenames (must exist in GRDOCS_PATH)
+        progress_callback : optional function called with (filename, current, total)
+
+    Returns:
+        dict with success, message, total_chunks, failed_files
+    """
+    pdf_files = [settings.GRDOCS_PATH / f for f in filenames]
+    pdf_files = [p for p in pdf_files if p.exists()]
+
+    if not pdf_files:
+        return {
+            "success": False,
+            "message": "None of the selected files were found on disk.",
+            "total_chunks": 0,
+            "failed_files": filenames,
+        }
+
+    all_documents = []
+    failed_files   = []
+
+    for i, pdf_path in enumerate(pdf_files):
+        if progress_callback:
+            progress_callback(pdf_path.name, i + 1, len(pdf_files))
+
+        try:
+            from core.ocr import load_pdf_with_ocr_fallback
+            pages = load_pdf_with_ocr_fallback(str(pdf_path))
+            for page in pages:
+                page.metadata["source_file"] = pdf_path.name
+            all_documents.extend(pages)
+        except Exception as e:
+            failed_files.append(pdf_path.name)
+            print(f"  ❌ Failed to load {pdf_path.name}: {e}")
+
+    if not all_documents:
+        return {
+            "success": False,
+            "message": "All selected PDFs failed to load.",
+            "total_chunks": 0,
+            "failed_files": failed_files,
+        }
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=settings.CHUNK_SIZE,
+        chunk_overlap=settings.CHUNK_OVERLAP,
+        separators=["\n\n", "\n", "।", ". ", " ", ""],
+    )
+    chunks = splitter.split_documents(all_documents)
+
+    try:
+        embeddings = get_embeddings()
+
+        existing_store = load_store()
+        if existing_store is None:
+            # No existing index yet — this becomes the first build
+            new_store = FAISS.from_documents(chunks, embeddings)
+        else:
+            existing_store.add_documents(chunks)
+            new_store = existing_store
+
+        settings.VECTORSTORE_PATH.mkdir(parents=True, exist_ok=True)
+        new_store.save_local(str(settings.VECTORSTORE_PATH))
+
+        clear_cache()
+
+        msg = f"Added {len(pdf_files) - len(failed_files)} PDF(s) — {len(chunks)} new chunks."
+        if failed_files:
+            msg += f" Failed: {', '.join(failed_files)}"
+
+        return {
+            "success":      True,
+            "message":      msg,
+            "total_chunks": len(chunks),
+            "failed_files": failed_files,
+        }
+
+    except Exception as e:
+        return {
+            "success":      False,
+            "message":      f"Incremental embedding failed: {str(e)}. Is Ollama running?",
+            "total_chunks": 0,
+            "failed_files": failed_files,
+        }
+
+
 def search(query: str, top_k: int = None) -> list[Document]:
     """
     Searches the FAISS index for chunks most relevant to the query.

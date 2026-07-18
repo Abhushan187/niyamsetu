@@ -19,10 +19,11 @@ import os
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, BackgroundTasks
+from pydantic import BaseModel
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from auth.router import get_admin_user
-from core.vectorstore import embed_all_pdfs, is_ready
+from core.vectorstore import embed_all_pdfs, add_pdfs_to_store, is_ready
 from core.gr_graph import build_graph
 from db.gr_meta import get_all_gr_metadata, mark_as_embedded
 from config import settings
@@ -186,3 +187,136 @@ async def get_embed_status(
         "state":        _embed_state,
         "vector_ready": is_ready(),
     }
+
+
+# ── Incremental "Add Selected" job state tracker ──────────
+# Separate from _embed_state so a full rebuild and a selective
+# add can be told apart by the frontend, and don't collide.
+_add_state = {
+    "running":      False,
+    "last_status":  "idle",
+    "last_message": "Not started",
+    "progress":     0,
+    "total_files":  0,
+    "current_file": "",
+}
+
+
+async def _run_add_job(filenames: list):
+    """
+    Background job for incrementally adding selected GRs to the
+    existing FAISS index (does NOT rebuild the whole store).
+    Wrapped in try/except/finally — same pattern as the full
+    rebuild fix — so it can't hang the same way that one did.
+    """
+    global _add_state
+
+    _add_state["running"]     = True
+    _add_state["last_status"] = "running"
+    _add_state["progress"]    = 0
+    _add_state["total_files"] = len(filenames)
+
+    def on_progress(filename: str, current: int, total: int):
+        _add_state["current_file"] = filename
+        _add_state["progress"]     = round((current / total) * 80)
+        _add_state["last_message"] = f"Embedding {filename} ({current}/{total})"
+
+    try:
+        result = await add_pdfs_to_store(filenames, progress_callback=on_progress)
+
+        if not result["success"]:
+            _add_state["last_status"]  = "failed"
+            _add_state["last_message"] = result["message"]
+            return
+
+        _add_state["progress"]     = 90
+        _add_state["last_message"] = "Updating document records..."
+
+        for filename in filenames:
+            if filename not in result.get("failed_files", []):
+                await mark_as_embedded(filename)
+
+        _add_state["progress"]     = 95
+        _add_state["last_message"] = "Rebuilding GR relationship graph..."
+
+        graph_result = await build_graph()
+
+        _add_state["last_status"]  = "done"
+        _add_state["progress"]     = 100
+        _add_state["last_message"] = (
+            f"Done. {result['total_chunks']} new chunks added. "
+            f"Graph: {graph_result.get('nodes', 0)} GRs, "
+            f"{graph_result.get('edges', 0)} relationships."
+        )
+
+    except Exception as e:
+        _add_state["last_status"]  = "failed"
+        _add_state["last_message"] = f"Add job crashed: {str(e)}"
+        print(f"❌ Add-to-index job crashed: {e}")
+
+    finally:
+        _add_state["running"] = False
+
+
+class AddFilesRequest(BaseModel):
+    filenames: list[str]
+
+
+@router.post("/add")
+async def add_selected_files(
+    request: AddFilesRequest,
+    background_tasks: BackgroundTasks,
+    admin: dict = Depends(get_admin_user),
+):
+    """
+    Incrementally embeds only the selected GR files into the existing
+    FAISS index — does not touch or rebuild already-embedded documents.
+    Admin only. Returns immediately, poll /api/embed/add-status.
+    """
+    global _add_state
+
+    if _add_state["running"]:
+        return {
+            "success": False,
+            "message": "An add-to-index job is already running.",
+            "state":   _add_state,
+        }
+
+    if not request.filenames:
+        return {"success": False, "message": "No files selected.", "state": _add_state}
+
+    # Skip files already embedded — avoids silent duplicate vectors
+    all_meta = await get_all_gr_metadata()
+    embedded_set = {m["filename"] for m in all_meta if m.get("embedded")}
+    to_add  = [f for f in request.filenames if f not in embedded_set]
+    skipped = [f for f in request.filenames if f in embedded_set]
+
+    if not to_add:
+        return {
+            "success": False,
+            "message": "All selected files are already embedded.",
+            "state":   _add_state,
+        }
+
+    _add_state.update({
+        "running":      True,
+        "last_status":  "running",
+        "last_message": f"Starting incremental embed for {len(to_add)} file(s)...",
+        "progress":     0,
+        "total_files":  len(to_add),
+        "current_file": "",
+    })
+
+    background_tasks.add_task(_run_add_job, to_add)
+
+    msg = f"Adding {len(to_add)} file(s) to the vector store."
+    if skipped:
+        msg += f" Skipped {len(skipped)} already-embedded file(s): {', '.join(skipped)}."
+
+    return {"success": True, "message": msg, "state": _add_state}
+
+
+@router.get("/add-status")
+async def get_add_status(admin: dict = Depends(get_admin_user)):
+    """Frontend polls this every 3s while an incremental add job runs."""
+    return {"success": True, "state": _add_state, "vector_ready": is_ready()}

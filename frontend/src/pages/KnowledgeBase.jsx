@@ -12,15 +12,28 @@ export default function KnowledgeBase() {
   const [loading,    setLoading]    = useState(true)
   const [error,      setError]      = useState('')
   const [embedState, setEmbedState] = useState(null)
-  const pollRef = useRef(null)
+  const [addState,   setAddState]   = useState(null)
+  const [selected,   setSelected]   = useState(new Set())
+  const pollRef    = useRef(null)
+  const addPollRef = useRef(null)
 
   const { pendingCount, batchState, startBatchSummarize } = useAdmin()
 
   useEffect(() => {
     loadFiles()
     checkStatus()
-    return () => stopPolling()
+    checkAddStatus()
+    return () => { stopPolling(); stopAddPolling() }
   }, [])
+
+  const toggleSelected = (filename) => {
+    setSelected(prev => {
+      const next = new Set(prev)
+      if (next.has(filename)) next.delete(filename)
+      else next.add(filename)
+      return next
+    })
+  }
 
   const loadFiles = async () => {
     setLoading(true)
@@ -59,6 +72,64 @@ export default function KnowledgeBase() {
 
   const stopPolling = () => {
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
+  }
+
+  const checkAddStatus = async () => {
+    try {
+      const res = await client.get('/embed/add-status')
+      setAddState(res.data.state)
+      if (res.data.state?.running) startAddPolling()
+    } catch { /* silent */ }
+  }
+
+  const startAddPolling = () => {
+    if (addPollRef.current) return
+    addPollRef.current = setInterval(async () => {
+      try {
+        const res = await client.get('/embed/add-status')
+        setAddState(res.data.state)
+        if (!res.data.state?.running) {
+          stopAddPolling()
+          loadFiles()
+        }
+      } catch { /* silent */ }
+    }, 3000)
+  }
+
+  const stopAddPolling = () => {
+    if (addPollRef.current) { clearInterval(addPollRef.current); addPollRef.current = null }
+  }
+
+  const addSelectedToIndex = async () => {
+    setError('')
+    if (selected.size === 0) return
+    try {
+      const res = await client.post('/embed/add', { filenames: Array.from(selected) })
+      if (!res.data.success) {
+        setError(res.data.message || 'Could not add selected files.')
+        return
+      }
+      setAddState(res.data.state)
+      startAddPolling()
+      setSelected(new Set())
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Could not add selected files.')
+    }
+  }
+
+  const summarizeSelected = async () => {
+    setError('')
+    if (selected.size === 0) return
+    try {
+      const res = await client.post('/summary/generate-selected', { filenames: Array.from(selected) })
+      if (!res.data.success) {
+        setError(res.data.message || 'Could not start summarization.')
+        return
+      }
+      setSelected(new Set())
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Could not start summarization.')
+    }
   }
 
   const startEmbedding = async () => {
@@ -162,6 +233,36 @@ export default function KnowledgeBase() {
             >
               {isBatchRunning ? '⏳ Summarizing…' : '📋 Summarize All'}
             </button>
+
+            <button
+              onClick={addSelectedToIndex}
+              disabled={addState?.running || selected.size === 0}
+              style={{
+                background: addState?.running || selected.size === 0 ? '#1A2A1F' : '#4ADE80',
+                color: addState?.running || selected.size === 0 ? '#5A7A65' : '#0F1117',
+                border: 'none', borderRadius: '10px',
+                padding: '11px 22px', fontSize: '0.88rem', fontWeight: '700',
+                cursor: addState?.running || selected.size === 0 ? 'not-allowed' : 'pointer',
+                fontFamily: 'Inter, sans-serif', whiteSpace: 'nowrap',
+              }}
+            >
+              {addState?.running ? '⏳ Adding…' : `➕ Add Selected (${selected.size})`}
+            </button>
+
+            <button
+              onClick={summarizeSelected}
+              disabled={isBatchRunning || selected.size === 0}
+              style={{
+                background: isBatchRunning || selected.size === 0 ? '#1E2135' : '#6FB3FF',
+                color: isBatchRunning || selected.size === 0 ? '#556' : '#0F1117',
+                border: 'none', borderRadius: '10px',
+                padding: '11px 22px', fontSize: '0.88rem', fontWeight: '700',
+                cursor: isBatchRunning || selected.size === 0 ? 'not-allowed' : 'pointer',
+                fontFamily: 'Inter, sans-serif', whiteSpace: 'nowrap',
+              }}
+            >
+              📋 Summarize Selected ({selected.size})
+            </button>
           </div>
         </div>
 
@@ -198,6 +299,23 @@ export default function KnowledgeBase() {
             </div>
           </div>
         )}
+
+        {/* Add-selected-to-index progress bar */}
+        {addState && (addState.running || addState.last_status !== 'idle') && (
+          <div style={{ marginTop: '16px' }}>
+            <div style={{ background: '#0F1117', borderRadius: '8px', height: '8px', overflow: 'hidden' }}>
+              <div style={{
+                width: `${addState.progress || 0}%`, height: '100%',
+                background: addState.last_status === 'failed' ? '#EF4444' : '#4ADE80',
+                transition: 'width 0.4s ease',
+              }} />
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '8px' }}>
+              <span style={{ color: '#7A7F94', fontSize: '0.78rem' }}>{addState.last_message}</span>
+              <span style={{ color: '#555', fontSize: '0.78rem', fontFamily: 'monospace' }}>{addState.progress || 0}%</span>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Document list */}
@@ -223,8 +341,13 @@ export default function KnowledgeBase() {
               padding: '12px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
             }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '10px', overflow: 'hidden' }}>
-                <span style={{ fontSize: '1.2rem', flexShrink: 0 }}>📄</span>
-                <div style={{ overflow: 'hidden' }}>
+                <input
+                  type="checkbox"
+                  checked={selected.has(f.filename)}
+                  onChange={() => toggleSelected(f.filename)}
+                  style={{ flexShrink: 0, width: '16px', height: '16px', cursor: 'pointer' }}
+                />
+                <span style={{ fontSize: '1.2rem', flexShrink: 0 }}>📄</span>                <div style={{ overflow: 'hidden' }}>
                   <div style={{
                     color: '#E8EAF0', fontSize: '0.85rem', fontWeight: '600',
                     whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
