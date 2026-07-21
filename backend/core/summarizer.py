@@ -39,7 +39,8 @@ def get_llm() -> OllamaLLM:
     return OllamaLLM(
         model=settings.LLM_MODEL,
         base_url=settings.OLLAMA_BASE_URL,
-        temperature=0.1,
+        temperature=0,
+        num_predict=1024,
     )
 
 
@@ -57,14 +58,24 @@ def _load_pdf_text(pdf_path: str) -> str:
     from core.ocr import load_pdf_with_ocr_fallback
     documents = load_pdf_with_ocr_fallback(pdf_path)
 
-    # Join all pages into one text block
+   # Join all pages into one text block
     full_text = "\n".join(doc.page_content for doc in documents)
+
+    # Strip distribution list / signature footer before it reaches the LLM.
+    # Every GR ends with "प्रत," (or "प्रत:") followed by a recipient list —
+    # never contains answerable content, confirmed across 15 real GRs.
+    cut_markers = ["प्रत,", "प्रत:", "प्रत :", "प्रत ", "\nप्रत\n"]
+    for marker in cut_markers:
+        idx = full_text.find(marker)
+        if idx != -1:
+            full_text = full_text[:idx]
+            break
 
     # Clean whitespace and normalize line breaks
     full_text = clean_text(full_text)
 
     # Truncate to fit LLM context window safely
-    full_text = truncate_for_context(full_text, max_chars=12000)
+    full_text = truncate_for_context(full_text, max_chars=20000)
 
     return full_text
 
@@ -96,6 +107,7 @@ async def extract_metadata(pdf_path: str) -> dict:
 Extract the following information from this Government Resolution document.
 Return ONLY valid JSON — no explanation, no markdown, no backticks.
 If a field is not found, use null.
+Ignore signatures, digital signature blocks, and recipient/distribution lists when extracting these fields.
 
 Required JSON format:
 {{
@@ -153,36 +165,36 @@ async def generate_summary(pdf_path: str) -> str:
     parser    = StrOutputParser()
 
     summary_prompt = PromptTemplate.from_template("""
-You are an expert analyst of Maharashtra Government Resolution documents.
-Provide a clear, structured summary of this Government Resolution.
+You are analyzing an official Maharashtra Government document (may be a policy resolution, circular, administrative order, or official letter — not all documents have every section below).
+
+Instructions:
+- ONLY use information present in the document text below.
+- Do NOT invent, assume, or infer facts not explicitly stated.
+- If a section does not apply to this document, write "Not applicable" — do not fabricate content to fill it.
+- Ignore any addresses, signatures, or recipient/distribution information if present — focus only on the actual decision or content.
 
 Include these sections (use the exact headings):
 
 1. PURPOSE
-What is the reason this resolution was issued?
+Why was this document issued?
 
-2. KEY PROVISIONS
-What are the main rules, decisions, or changes introduced?
+2. KEY CONTENT
+What are the main decisions, rules, or facts stated?
 
-3. BENEFICIARIES / TARGET GROUP
-Who does this resolution apply to or benefit?
+3. WHO IT AFFECTS
+Which people, roles, or offices does this concern, if stated?
 
-4. FINANCIAL IMPLICATIONS
-Are there any monetary allocations, grants, or financial impacts?
+4. FINANCIAL DETAILS
+Any monetary amounts, budget codes, or allocations — if none, write "Not applicable."
 
-5. IMPLEMENTATION
-How and when does this resolution take effect?
+5. DATES / TIMELINE
+Any effective dates, deadlines, or tenures mentioned.
 
-6. IMPORTANT DATES / DEADLINES
-List any specific dates mentioned.
-
-Keep each section concise — 2 to 4 sentences maximum.
-If information for a section is not available, write "Not specified."
+Keep each section concise — 1 to 3 sentences maximum.
 
 Document:
 {text}
 """)
-
     chain   = summary_prompt | llm | parser
     summary = chain.invoke({"text": full_text})
     return summary.strip()
