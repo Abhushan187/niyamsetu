@@ -59,6 +59,12 @@ async def _run_embedding_job():
         2. Mark each PDF as embedded in MongoDB
         3. Build GR relationship graph
         4. Update final state
+
+    Wrapped in try/except/finally: if ANY step throws an unhandled
+    exception, "running" must still reset to False, otherwise the
+    frontend sees a permanently stuck progress bar and /start refuses
+    to start a new job ("already running") forever, requiring a
+    server restart to recover.
     """
     global _embed_state
 
@@ -77,41 +83,51 @@ async def _run_embedding_job():
         _embed_state["progress"]     = round((current / total) * 80)  # 0-80%
         _embed_state["last_message"] = f"Embedding {filename} ({current}/{total})"
 
-    # ── Step 1: Embed PDFs ────────────────────────────────
-    result = await embed_all_pdfs(progress_callback=on_progress)
+    try:
+        # ── Step 1: Embed PDFs ────────────────────────────
+        result = await embed_all_pdfs(progress_callback=on_progress)
 
-    if not result["success"]:
-        _embed_state["running"]      = False
+        if not result["success"]:
+            _embed_state["last_status"]  = "failed"
+            _embed_state["last_message"] = result["message"]
+            return
+
+        _embed_state["total_chunks"] = result["total_chunks"]
+        _embed_state["progress"]     = 85
+        _embed_state["last_message"] = "Updating document records..."
+
+        # ── Step 2: Mark files as embedded in MongoDB ─────
+        for pdf_file in pdf_files:
+            if pdf_file.name not in result.get("failed_files", []):
+                await mark_as_embedded(pdf_file.name)
+
+        _embed_state["progress"]     = 90
+        _embed_state["last_message"] = "Building GR relationship graph..."
+
+        # ── Step 3: Build GR graph ────────────────────────
+        graph_result = await build_graph()
+
+        # ── Step 4: Mark complete ─────────────────────────
+        _embed_state["last_status"]  = "done"
+        _embed_state["progress"]     = 100
+        _embed_state["last_message"] = (
+            f"Done. {result['total_chunks']} chunks embedded. "
+            f"Graph: {graph_result.get('nodes', 0)} GRs, "
+            f"{graph_result.get('edges', 0)} relationships."
+        )
+
+    except Exception as e:
+        # Catch anything unhandled from steps 1-3 (Mongo write failure,
+        # PDF read error in build_graph, etc.) so the job never hangs silently.
         _embed_state["last_status"]  = "failed"
-        _embed_state["last_message"] = result["message"]
-        _embed_state["finished_at"]  = str(datetime.now(timezone.utc))
-        return
+        _embed_state["last_message"] = f"Embedding job crashed: {str(e)}"
+        print(f"❌ Embedding job crashed: {e}")
 
-    _embed_state["total_chunks"] = result["total_chunks"]
-    _embed_state["progress"]     = 85
-    _embed_state["last_message"] = "Updating document records..."
-
-    # ── Step 2: Mark files as embedded in MongoDB ─────────
-    for pdf_file in pdf_files:
-        if pdf_file.name not in result.get("failed_files", []):
-            await mark_as_embedded(pdf_file.name)
-
-    _embed_state["progress"]     = 90
-    _embed_state["last_message"] = "Building GR relationship graph..."
-
-    # ── Step 3: Build GR graph ────────────────────────────
-    graph_result = await build_graph()
-
-    # ── Step 4: Mark complete ─────────────────────────────
-    _embed_state["running"]      = False
-    _embed_state["last_status"]  = "done"
-    _embed_state["progress"]     = 100
-    _embed_state["finished_at"]  = str(datetime.now(timezone.utc))
-    _embed_state["last_message"] = (
-        f"Done. {result['total_chunks']} chunks embedded. "
-        f"Graph: {graph_result.get('nodes', 0)} GRs, "
-        f"{graph_result.get('edges', 0)} relationships."
-    )
+    finally:
+        # This ALWAYS runs, success or failure — guarantees the UI
+        # never gets stuck showing "running" forever.
+        _embed_state["running"]     = False
+        _embed_state["finished_at"] = str(datetime.now(timezone.utc))
 
 
 @router.post("/start")
