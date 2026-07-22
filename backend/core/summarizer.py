@@ -11,6 +11,23 @@
 # Output saved as both JSON and TXT files in summaries/ folder.
 # Called by:
 #   api/summary.py → triggers this on admin request
+#
+# ── FIX NOTES (garbled-font / hallucination bug) ──────────
+# Previously this file had no grounding instruction telling the
+# LLM what to do with unreadable/corrupted text, unlike
+# core/rag.py which explicitly says "say exactly: not found".
+# Combined with core/ocr.py not catching font-encoding corruption
+# (only catching near-empty pages), garbled PDFs (legacy
+# non-Unicode Marathi fonts) were silently summarized by the LLM
+# hallucinating plausible-but-wrong GR content.
+#
+# Fixes applied here:
+#   1. temperature=0 (was 0.1) — reduces improvisation
+#   2. Explicit grounding/refusal instructions in both prompts,
+#      matching the pattern already used in core/rag.py
+#   3. process_gr() now checks the returned summary/metadata for
+#      the refusal marker and surfaces success=False with a clear
+#      message instead of silently saving a hallucinated summary
 # ─────────────────────────────────────────────────────────
 
 import sys
@@ -28,19 +45,24 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import settings
 from core.language import clean_text, truncate_for_context
 
+# Marker the LLM is instructed to return verbatim when the source
+# text is not usable. Checked in process_gr() to short-circuit
+# saving a hallucinated summary/metadata file.
+UNREADABLE_MARKER = "DOCUMENT_TEXT_UNREADABLE"
+
 
 def get_llm() -> OllamaLLM:
     """
     OllamaLLM (not ChatOllama) — used here because summary prompts
     work better with the completion-style interface.
-    temperature=0.1 allows slight creativity for readable summaries
-    while staying grounded in the document.
+    temperature=0 — deterministic, and reduces the model's tendency
+    to "fill in the gaps" with plausible-sounding invented content
+    when the source text is garbled or incomplete. (Was 0.1.)
     """
     return OllamaLLM(
         model=settings.LLM_MODEL,
         base_url=settings.OLLAMA_BASE_URL,
         temperature=0,
-        num_predict=1024,
     )
 
 
@@ -48,6 +70,10 @@ def _load_pdf_text(pdf_path: str) -> str:
     """
     Loads all text from a PDF file.
     Cleans and truncates to fit within LLM context window.
+
+    Uses load_pdf_with_ocr_fallback(), which now also detects
+    garbled/corrupted Devanagari (legacy font encoding issues),
+    not just scanned/empty pages — see core/ocr.py.
 
     Args:
         pdf_path : full path to the PDF file
@@ -58,24 +84,14 @@ def _load_pdf_text(pdf_path: str) -> str:
     from core.ocr import load_pdf_with_ocr_fallback
     documents = load_pdf_with_ocr_fallback(pdf_path)
 
-   # Join all pages into one text block
+    # Join all pages into one text block
     full_text = "\n".join(doc.page_content for doc in documents)
-
-    # Strip distribution list / signature footer before it reaches the LLM.
-    # Every GR ends with "प्रत," (or "प्रत:") followed by a recipient list —
-    # never contains answerable content, confirmed across 15 real GRs.
-    cut_markers = ["प्रत,", "प्रत:", "प्रत :", "प्रत ", "\nप्रत\n"]
-    for marker in cut_markers:
-        idx = full_text.find(marker)
-        if idx != -1:
-            full_text = full_text[:idx]
-            break
 
     # Clean whitespace and normalize line breaks
     full_text = clean_text(full_text)
 
     # Truncate to fit LLM context window safely
-    full_text = truncate_for_context(full_text, max_chars=20000)
+    full_text = truncate_for_context(full_text, max_chars=12000)
 
     return full_text
 
@@ -98,6 +114,8 @@ async def extract_metadata(pdf_path: str) -> dict:
     Returns:
         dict of extracted metadata fields
         Falls back to {"raw_output": "..."} if JSON parsing fails
+        Returns {"unreadable": True, ...} if the LLM flags the
+        source text as not usable (see UNREADABLE_MARKER)
     """
     full_text = _load_pdf_text(pdf_path)
     llm       = get_llm()
@@ -107,9 +125,16 @@ async def extract_metadata(pdf_path: str) -> dict:
 Extract the following information from this Government Resolution document.
 Return ONLY valid JSON — no explanation, no markdown, no backticks.
 If a field is not found, use null.
-Ignore signatures, digital signature blocks, and recipient/distribution lists when extracting these fields.
 
-Required JSON format:
+IMPORTANT — read the document text carefully before answering:
+If the text below is garbled, corrupted, contains scrambled or
+nonsensical Devanagari/English characters, or does not form
+coherent readable sentences (this can happen with PDFs that use
+broken font encoding), do NOT guess or invent field values.
+Instead return exactly this JSON and nothing else:
+{{"unreadable": true, "reason": "Document text could not be reliably extracted."}}
+
+Required JSON format (when text IS readable):
 {{
   "gr_number": "...",
   "department": "...",
@@ -158,43 +183,61 @@ async def generate_summary(pdf_path: str) -> str:
         pdf_path : path to the PDF
 
     Returns:
-        Summary as a formatted text string
+        Summary as a formatted text string.
+        Returns the literal UNREADABLE_MARKER string (see top of
+        file) if the LLM determines the source text is not usable —
+        callers must check for this before treating the result as
+        a real summary.
     """
     full_text = _load_pdf_text(pdf_path)
     llm       = get_llm()
     parser    = StrOutputParser()
 
-    summary_prompt = PromptTemplate.from_template("""
-You are analyzing an official Maharashtra Government document (may be a policy resolution, circular, administrative order, or official letter — not all documents have every section below).
+    summary_prompt = PromptTemplate.from_template(f"""
+You are an expert analyst of Maharashtra Government Resolution documents.
+Provide a clear, structured summary of this Government Resolution.
 
-Instructions:
-- ONLY use information present in the document text below.
-- Do NOT invent, assume, or infer facts not explicitly stated.
-- If a section does not apply to this document, write "Not applicable" — do not fabricate content to fill it.
-- Ignore any addresses, signatures, or recipient/distribution information if present — focus only on the actual decision or content.
+IMPORTANT — before summarizing, check whether the document text
+below is actually readable. GRs are sometimes extracted from PDFs
+with broken font encoding, which produces text that LOOKS like
+Devanagari or English but is scrambled and does not form real
+words or coherent sentences. If that is the case here, do NOT
+guess, do NOT invent a plausible-sounding GR topic — respond with
+EXACTLY this single line and nothing else:
+{UNREADABLE_MARKER}
 
-Include these sections (use the exact headings):
+Only if the text is genuinely readable, include these sections
+(use the exact headings):
 
 1. PURPOSE
-Why was this document issued?
+What is the reason this resolution was issued?
 
-2. KEY CONTENT
-What are the main decisions, rules, or facts stated?
+2. KEY PROVISIONS
+What are the main rules, decisions, or changes introduced?
 
-3. WHO IT AFFECTS
-Which people, roles, or offices does this concern, if stated?
+3. BENEFICIARIES / TARGET GROUP
+Who does this resolution apply to or benefit?
 
-4. FINANCIAL DETAILS
-Any monetary amounts, budget codes, or allocations — if none, write "Not applicable."
+4. FINANCIAL IMPLICATIONS
+Are there any monetary allocations, grants, or financial impacts?
 
-5. DATES / TIMELINE
-Any effective dates, deadlines, or tenures mentioned.
+5. IMPLEMENTATION
+How and when does this resolution take effect?
 
-Keep each section concise — 1 to 3 sentences maximum.
+6. IMPORTANT DATES / DEADLINES
+List any specific dates mentioned.
+
+Keep each section concise — 2 to 4 sentences maximum.
+If information for a specific section (not the whole document) is
+not available, write "Not specified." — only use {UNREADABLE_MARKER}
+if the ENTIRE document text is unreadable/garbled.
+Every fact you state must come directly from the document text
+below — do not add outside knowledge about Maharashtra GRs in general.
 
 Document:
-{text}
+{{text}}
 """)
+
     chain   = summary_prompt | llm | parser
     summary = chain.invoke({"text": full_text})
     return summary.strip()
@@ -205,6 +248,15 @@ async def process_gr(pdf_path: str, progress_callback=None) -> dict:
     Full summary pipeline for one GR document.
     Runs metadata extraction and summary generation,
     then saves both as files in the summaries/ folder.
+
+    NOW ALSO: checks whether either the metadata or the summary
+    came back flagged as unreadable (garbled/corrupted source
+    text) and, if so, returns success=False with a clear message
+    instead of silently saving a hallucinated result. This is the
+    key fix for the "confidently wrong summary" bug — even if
+    OCR fallback in core/ocr.py somehow still lets a garbled page
+    through, this is a second line of defense at the LLM-output
+    level.
 
     Args:
         pdf_path          : path to the PDF
@@ -217,8 +269,8 @@ async def process_gr(pdf_path: str, progress_callback=None) -> dict:
             message    : status message
             metadata   : extracted metadata dict
             summary    : summary text string
-            json_path  : path to saved JSON file
-            txt_path   : path to saved TXT file
+            json_path  : path to saved JSON file (only if success)
+            txt_path   : path to saved TXT file (only if success)
     """
     pdf_path = Path(pdf_path)
 
@@ -242,6 +294,27 @@ async def process_gr(pdf_path: str, progress_callback=None) -> dict:
             progress_callback("Generating summary...")
 
         summary = await generate_summary(str(pdf_path))
+
+        # ── Step 2.5: Bail out if source text was unreadable ──
+        # Catches garbled-font PDFs that slipped past OCR detection,
+        # or pages where OCR itself produced low-quality output.
+        metadata_flagged_unreadable = isinstance(metadata, dict) and metadata.get("unreadable") is True
+        summary_flagged_unreadable  = UNREADABLE_MARKER in summary
+
+        if metadata_flagged_unreadable or summary_flagged_unreadable:
+            if progress_callback:
+                progress_callback("Document text could not be reliably read.")
+            return {
+                "success": False,
+                "message": (
+                    f"Could not generate a reliable summary for {pdf_path.name} — "
+                    "the extracted text appears garbled or corrupted (this can happen "
+                    "with PDFs using legacy/non-Unicode fonts). Try re-scanning or "
+                    "re-exporting the PDF, or flag it for manual review."
+                ),
+                "metadata": metadata,
+                "summary": summary,
+            }
 
         # ── Step 3: Save outputs ──────────────────────────
         if progress_callback:

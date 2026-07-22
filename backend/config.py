@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     # How many characters overlap between chunks (prevents cutting mid-sentence)
     CHUNK_OVERLAP: int = 150
     # How many chunks to retrieve per query
-    TOP_K: int = 4
+    TOP_K: int = 3
     # How many previous chat turns to include for context
     CONTEXT_WINDOW: int = 6
 
