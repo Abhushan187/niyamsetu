@@ -6,6 +6,19 @@
 #   1. embed_all_pdfs()  → reads PDFs, creates embeddings, saves FAISS index
 #   2. search()          → finds the most relevant chunks for a query
 #
+# Pipeline (updated):
+#   Upload PDF → OCR (Tesseract, core/ocr.py) →
+#   Preprocessing (core/preprocessing.py, NEW) →
+#   Chunking → Embeddings → Vector Store → RAG
+#
+# Preprocessing step added: raw OCR/extracted page text is cleaned
+# (repeated header/footer stripped, whitespace normalized, broken
+# paragraphs rejoined) via core/preprocessing.py BEFORE it reaches
+# the text splitter. vectorstore.py owns re-wrapping the cleaned
+# strings back into LangChain Document objects with their original
+# metadata intact — preprocessing.py itself stays framework-agnostic
+# and doesn't know about LangChain.
+#
 # Called by:
 #   api/embed.py  → triggers embed_all_pdfs()
 #   core/rag.py   → calls search() before sending to LLM
@@ -33,6 +46,7 @@ from langchain_core.documents import Document
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import settings
+from core.preprocessing import preprocess_document
 
 
 # ── Module-level cache ────────────────────────────────────
@@ -109,17 +123,51 @@ def clear_cache():
     _vector_store = None
 
 
+def _preprocess_pages_for_pdf(pages: list[Document]) -> list[Document]:
+    """
+    Runs core.preprocessing.preprocess_document() on all pages of a
+    single PDF and re-wraps the cleaned text back into Document
+    objects, preserving each page's original metadata (source_file,
+    page number, ocr_used, etc.) untouched.
+
+    This is where the LangChain-specific glue lives — preprocessing.py
+    itself works with plain strings only, so it stays reusable outside
+    a LangChain context if needed later.
+
+    Args:
+        pages : list of Document objects for one PDF, in page order
+                (as returned by core.ocr.load_pdf_with_ocr_fallback())
+
+    Returns:
+        New list of Document objects, same length/order/metadata,
+        with cleaned page_content
+    """
+    raw_texts = [page.page_content for page in pages]
+    cleaned_texts = preprocess_document(raw_texts)
+
+    cleaned_pages = []
+    for original_page, cleaned_text in zip(pages, cleaned_texts):
+        cleaned_pages.append(Document(
+            page_content=cleaned_text,
+            metadata=original_page.metadata,
+        ))
+    return cleaned_pages
+
+
 async def embed_all_pdfs(progress_callback=None) -> dict:
     """
     Main embedding function — processes all PDFs in GRDOCS folder.
 
     Steps:
         1. Find all PDFs in grdocs/ folder
-        2. Load each PDF into pages using PyPDFLoader
-        3. Split pages into chunks using RecursiveCharacterTextSplitter
-        4. Generate embeddings for each chunk via Ollama
-        5. Save FAISS index to disk
-        6. Clear cache so next query uses fresh index
+        2. Load each PDF into pages using PyPDFLoader (with OCR fallback)
+        3. Preprocess each PDF's pages (NEW) — strip repeated
+           headers/footers, normalize whitespace, rejoin broken
+           paragraphs — before any chunking happens
+        4. Split cleaned pages into chunks using RecursiveCharacterTextSplitter
+        5. Generate embeddings for each chunk via Ollama
+        6. Save FAISS index to disk
+        7. Clear cache so next query uses fresh index
 
     Args:
         progress_callback : optional function called with (filename, current, total)
@@ -142,7 +190,7 @@ async def embed_all_pdfs(progress_callback=None) -> dict:
     all_documents = []
     failed_files   = []
 
-    # ── Step 1 & 2: Load each PDF ─────────────────────────
+    # ── Step 1, 2 & 3: Load, then preprocess each PDF ─────
     for i, pdf_path in enumerate(pdf_files):
         if progress_callback:
             progress_callback(pdf_path.name, i + 1, len(pdf_files))
@@ -157,8 +205,13 @@ async def embed_all_pdfs(progress_callback=None) -> dict:
             for page in pages:
                 page.metadata["source_file"] = pdf_path.name
 
+            # NEW: preprocess this PDF's pages together (document-level,
+            # not page-in-isolation) so repeated header/footer lines can
+            # be detected across pages and stripped before chunking.
+            pages = _preprocess_pages_for_pdf(pages)
+
             all_documents.extend(pages)
-            print(f"  ✅ Loaded: {pdf_path.name} ({len(pages)} pages)")
+            print(f"  ✅ Loaded + preprocessed: {pdf_path.name} ({len(pages)} pages)")
 
         except Exception as e:
             failed_files.append(pdf_path.name)
@@ -172,7 +225,7 @@ async def embed_all_pdfs(progress_callback=None) -> dict:
             "failed_files": failed_files,
         }
 
-    # ── Step 3: Split into chunks ─────────────────────────
+    # ── Step 4: Split into chunks ─────────────────────────
     # RecursiveCharacterTextSplitter tries to split at:
     # paragraphs → sentences → words → characters (in that order)
     # This preserves meaning better than hard character cuts
@@ -185,7 +238,7 @@ async def embed_all_pdfs(progress_callback=None) -> dict:
     chunks = splitter.split_documents(all_documents)
     print(f"  📄 Total chunks created: {len(chunks)}")
 
-    # ── Step 4 & 5: Embed and save ────────────────────────
+    # ── Step 5 & 6: Embed and save ────────────────────────
     try:
         embeddings = get_embeddings()
 
@@ -201,7 +254,7 @@ async def embed_all_pdfs(progress_callback=None) -> dict:
         vector_store.save_local(str(settings.VECTORSTORE_PATH))
         print(f"  💾 Vector store saved to: {settings.VECTORSTORE_PATH}")
 
-        # ── Step 6: Clear cache ───────────────────────────
+        # ── Step 7: Clear cache ───────────────────────────
         # Force next search() call to reload fresh index
         clear_cache()
 
@@ -220,100 +273,6 @@ async def embed_all_pdfs(progress_callback=None) -> dict:
         return {
             "success":      False,
             "message":      f"Embedding failed: {str(e)}. Is Ollama running?",
-            "total_chunks": 0,
-            "failed_files": failed_files,
-        }
-
-
-async def add_pdfs_to_store(filenames: list, progress_callback=None) -> dict:
-    """
-    Incrementally adds specific PDFs to the existing FAISS index,
-    without rebuilding the whole vector store from scratch.
-    Used by the "Add Selected" button in KnowledgeBase — lets admin
-    embed newly uploaded GRs without waiting through a full rebuild
-    of everything already embedded.
-
-    Args:
-        filenames         : list of PDF filenames (must exist in GRDOCS_PATH)
-        progress_callback : optional function called with (filename, current, total)
-
-    Returns:
-        dict with success, message, total_chunks, failed_files
-    """
-    pdf_files = [settings.GRDOCS_PATH / f for f in filenames]
-    pdf_files = [p for p in pdf_files if p.exists()]
-
-    if not pdf_files:
-        return {
-            "success": False,
-            "message": "None of the selected files were found on disk.",
-            "total_chunks": 0,
-            "failed_files": filenames,
-        }
-
-    all_documents = []
-    failed_files   = []
-
-    for i, pdf_path in enumerate(pdf_files):
-        if progress_callback:
-            progress_callback(pdf_path.name, i + 1, len(pdf_files))
-
-        try:
-            from core.ocr import load_pdf_with_ocr_fallback
-            pages = load_pdf_with_ocr_fallback(str(pdf_path))
-            for page in pages:
-                page.metadata["source_file"] = pdf_path.name
-            all_documents.extend(pages)
-        except Exception as e:
-            failed_files.append(pdf_path.name)
-            print(f"  ❌ Failed to load {pdf_path.name}: {e}")
-
-    if not all_documents:
-        return {
-            "success": False,
-            "message": "All selected PDFs failed to load.",
-            "total_chunks": 0,
-            "failed_files": failed_files,
-        }
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=settings.CHUNK_SIZE,
-        chunk_overlap=settings.CHUNK_OVERLAP,
-        separators=["\n\n", "\n", "।", ". ", " ", ""],
-    )
-    chunks = splitter.split_documents(all_documents)
-
-    try:
-        embeddings = get_embeddings()
-
-        existing_store = load_store()
-        if existing_store is None:
-            # No existing index yet — this becomes the first build
-            new_store = FAISS.from_documents(chunks, embeddings)
-        else:
-            existing_store.add_documents(chunks)
-            new_store = existing_store
-
-        settings.VECTORSTORE_PATH.mkdir(parents=True, exist_ok=True)
-        new_store.save_local(str(settings.VECTORSTORE_PATH))
-
-        clear_cache()
-
-        msg = f"Added {len(pdf_files) - len(failed_files)} PDF(s) — {len(chunks)} new chunks."
-        if failed_files:
-            msg += f" Failed: {', '.join(failed_files)}"
-
-        return {
-            "success":      True,
-            "message":      msg,
-            "total_chunks": len(chunks),
-            "failed_files": failed_files,
-        }
-
-    except Exception as e:
-        return {
-            "success":      False,
-            "message":      f"Incremental embedding failed: {str(e)}. Is Ollama running?",
             "total_chunks": 0,
             "failed_files": failed_files,
         }
